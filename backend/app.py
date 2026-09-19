@@ -86,6 +86,9 @@ ALLOWED_IMAGE_TYPES = {
     "image/png": ".png",
     "image/gif": ".gif",
 }
+ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif"}
+MAX_BATCH_FILES = 8
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 mongo_client: AsyncIOMotorClient | None = None
 
@@ -174,6 +177,31 @@ class CreateBody(BaseModel):
     description: str
     userid: str | None = None
     image: str | None = None
+    overlay: str | None = None
+    inner_mask: str | None = None
+    outer_mask: str | None = None
+    outer_fat: float | int | None = None
+    inner_fat: float | int | None = None
+    length: float | int | None = None
+    width: float | int | None = None
+
+
+class CreateBatchItem(BaseModel):
+    number: str | int
+    description: str
+    image: str
+    overlay: str | None = None
+    inner_mask: str | None = None
+    outer_mask: str | None = None
+    outer_fat: float | int | None = None
+    inner_fat: float | int | None = None
+    length: float | int | None = None
+    width: float | int | None = None
+
+
+class CreateBatchBody(BaseModel):
+    userid: str | None = None
+    items: list[CreateBatchItem] = Field(default_factory=list)
 
 
 def hash_password(password: str) -> str:
@@ -245,6 +273,90 @@ def serialize_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def image_suffix(content_type: str, filename: str) -> str | None:
+    suffix = ALLOWED_IMAGE_TYPES.get((content_type or "").lower())
+    if suffix is None:
+        original = Path(filename or "").suffix.lower()
+        suffix = original if original in ALLOWED_IMAGE_SUFFIXES else None
+    if suffix == ".jpeg":
+        suffix = ".jpg"
+    return suffix
+
+
+def upload_urls(origin: str, filename: str, metrics: dict[str, Any]) -> dict[str, Any]:
+    image_url = f"{origin}/uploads/{filename}"
+    overlay_name = metrics.get("overlay_file")
+    inner_mask_name = metrics.get("inner_mask_file")
+    outer_mask_name = metrics.get("outer_mask_file")
+    return {
+        "message": "Image uploaded",
+        "image": image_url,
+        "url": image_url,
+        "overlay": f"{origin}/uploads/{overlay_name}" if overlay_name else None,
+        "innerMask": f"{origin}/uploads/{inner_mask_name}" if inner_mask_name else None,
+        "outerMask": f"{origin}/uploads/{outer_mask_name}" if outer_mask_name else None,
+        "outerFat": metrics["outerFat"],
+        "innerFat": metrics["innerFat"],
+        "length": metrics["length"],
+        "width": metrics["width"],
+    }
+
+
+def save_and_analyze(payload: bytes, suffix: str, origin: str) -> dict[str, Any]:
+    filename = f"{uuid.uuid4().hex}{suffix}"
+    dest = UPLOAD_DIR / filename
+    dest.write_bytes(payload)
+    metrics = analyze_image(str(dest), out_dir=str(UPLOAD_DIR))
+    return upload_urls(origin, filename, metrics)
+
+
+def store_last_upload(request: Request, userid: str, result: dict[str, Any]) -> None:
+    request.session["userid"] = userid
+    request.session["uploaded_image"] = result.get("image")
+    request.session["overlay_image"] = result.get("overlay")
+    request.session["inner_mask"] = result.get("innerMask")
+    request.session["outer_mask"] = result.get("outerMask")
+    request.session["outerFat"] = result.get("outerFat", 0)
+    request.session["innerFat"] = result.get("innerFat", 0)
+    request.session["length"] = result.get("length", 0)
+    request.session["width"] = result.get("width", 0)
+
+
+def _session_or_body(body_value: Any, session_key: str, request: Request, default: Any = "") -> Any:
+    if body_value is not None:
+        return body_value
+    value = request.session.get(session_key, default)
+    return default if value is None else value
+
+
+def analysis_document(
+    userid: str,
+    number: str | int,
+    description: str,
+    image_url: str,
+    overlay: Any = "",
+    inner_mask: Any = "",
+    outer_mask: Any = "",
+    outer_fat: Any = 0,
+    inner_fat: Any = 0,
+    length: Any = 0,
+    width: Any = 0,
+) -> dict[str, Any]:
+    return {
+        "image": image_url,
+        "overlay": overlay or "",
+        "inner_mask": inner_mask or "",
+        "outer_mask": outer_mask or "",
+        "number": number,
+        "description": description,
+        "userid": userid,
+        "outer_fat": 0 if outer_fat is None else outer_fat,
+        "inner_fat": 0 if inner_fat is None else inner_fat,
+        "length": 0 if length is None else length,
+        "width": 0 if width is None else width,
+    }
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -287,52 +399,91 @@ async def logout(request: Request):
 @app.post("/upload-image")
 async def upload_image(request: Request, image: UploadFile = File(...)):
     userid = require_userid(request)
-    content_type = (image.content_type or "").lower()
-    suffix = ALLOWED_IMAGE_TYPES.get(content_type)
-    if suffix is None:
-        original = Path(image.filename or "").suffix.lower()
-        suffix = original if original in {".jpg", ".jpeg", ".png", ".gif"} else None
+    suffix = image_suffix(image.content_type or "", image.filename or "")
     if suffix is None:
         raise HTTPException(status_code=400, detail="Image must be JPG, PNG, or GIF")
-    if suffix == ".jpeg":
-        suffix = ".jpg"
 
-    filename = f"{uuid.uuid4().hex}{suffix}"
-    dest = UPLOAD_DIR / filename
     payload = await image.read()
     if not payload:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
-    dest.write_bytes(payload)
+    if len(payload) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="Image exceeds the 10 MB size limit")
 
-    metrics = analyze_image(str(dest), out_dir=str(UPLOAD_DIR))
+    result = save_and_analyze(payload, suffix, public_base_url(request))
+    store_last_upload(request, userid, result)
+    return result
+
+
+@app.post("/upload-images")
+async def upload_images(request: Request, images: list[UploadFile] | None = File(default=None)):
+    userid = require_userid(request)
+    files = images or []
+    if not files:
+        raise HTTPException(status_code=400, detail="請至少選擇一張影像。")
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(status_code=400, detail=f"一次最多上傳 {MAX_BATCH_FILES} 張影像。")
+
     origin = public_base_url(request)
-    image_url = f"{origin}/uploads/{filename}"
-    overlay_name = metrics.get("overlay_file")
-    overlay_url = f"{origin}/uploads/{overlay_name}" if overlay_name else None
-    inner_mask_name = metrics.get("inner_mask_file")
-    outer_mask_name = metrics.get("outer_mask_file")
-    inner_mask_url = f"{origin}/uploads/{inner_mask_name}" if inner_mask_name else None
-    outer_mask_url = f"{origin}/uploads/{outer_mask_name}" if outer_mask_name else None
-    request.session["userid"] = userid
-    request.session["uploaded_image"] = image_url
-    request.session["overlay_image"] = overlay_url
-    request.session["inner_mask"] = inner_mask_url
-    request.session["outer_mask"] = outer_mask_url
-    request.session["outerFat"] = metrics["outerFat"]
-    request.session["innerFat"] = metrics["innerFat"]
-    request.session["length"] = metrics["length"]
-    request.session["width"] = metrics["width"]
+    results: list[dict[str, Any]] = []
+    last_ok: dict[str, Any] | None = None
+
+    for index, image in enumerate(files):
+        filename = image.filename or f"image-{index + 1}"
+        suffix = image_suffix(image.content_type or "", filename)
+        if suffix is None:
+            results.append(
+                {
+                    "index": index,
+                    "filename": filename,
+                    "success": False,
+                    "error": "影像須為 JPG、PNG 或 GIF。",
+                }
+            )
+            continue
+        payload = await image.read()
+        if not payload:
+            results.append(
+                {
+                    "index": index,
+                    "filename": filename,
+                    "success": False,
+                    "error": "上傳的檔案是空的。",
+                }
+            )
+            continue
+        if len(payload) > MAX_UPLOAD_BYTES:
+            results.append(
+                {
+                    "index": index,
+                    "filename": filename,
+                    "success": False,
+                    "error": "檔案超過 10 MB 上限。",
+                }
+            )
+            continue
+        try:
+            item = save_and_analyze(payload, suffix, origin)
+            last_ok = item
+            results.append({"index": index, "filename": filename, "success": True, "error": None, **item})
+        except Exception:
+            results.append(
+                {
+                    "index": index,
+                    "filename": filename,
+                    "success": False,
+                    "error": "分析失敗，請再試一次。",
+                }
+            )
+
+    if last_ok is not None:
+        store_last_upload(request, userid, last_ok)
+
+    succeeded = sum(1 for item in results if item.get("success"))
     return {
-        "message": "Image uploaded",
-        "image": image_url,
-        "url": image_url,
-        "overlay": overlay_url,
-        "innerMask": inner_mask_url,
-        "outerMask": outer_mask_url,
-        "outerFat": metrics["outerFat"],
-        "innerFat": metrics["innerFat"],
-        "length": metrics["length"],
-        "width": metrics["width"],
+        "message": "批次分析完成",
+        "results": results,
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
     }
 
 
@@ -345,23 +496,61 @@ async def create_analysis(request: Request, body: CreateBody):
     if not image_url:
         raise HTTPException(status_code=400, detail="No uploaded image found. Upload an image first.")
 
-    doc = {
-        "image": image_url,
-        "overlay": request.session.get("overlay_image", ""),
-        "inner_mask": request.session.get("inner_mask", ""),
-        "outer_mask": request.session.get("outer_mask", ""),
-        "number": body.number,
-        "description": body.description,
-        "userid": userid,
-        "outer_fat": request.session.get("outerFat", 0),
-        "inner_fat": request.session.get("innerFat", 0),
-        "length": request.session.get("length", 0),
-        "width": request.session.get("width", 0),
-    }
+    doc = analysis_document(
+        userid=userid,
+        number=body.number,
+        description=body.description,
+        image_url=str(image_url),
+        overlay=_session_or_body(body.overlay, "overlay_image", request),
+        inner_mask=_session_or_body(body.inner_mask, "inner_mask", request),
+        outer_mask=_session_or_body(body.outer_mask, "outer_mask", request),
+        outer_fat=_session_or_body(body.outer_fat, "outerFat", request, 0),
+        inner_fat=_session_or_body(body.inner_fat, "innerFat", request, 0),
+        length=_session_or_body(body.length, "length", request, 0),
+        width=_session_or_body(body.width, "width", request, 0),
+    )
     db = get_db()
     result = await db.analyses.insert_one(doc)
     created = await db.analyses.find_one({"_id": result.inserted_id})
     return {"message": "Analysis created", **serialize_analysis(created or {**doc, "_id": result.inserted_id})}
+
+
+@app.post("/create-batch")
+async def create_batch(request: Request, body: CreateBatchBody):
+    userid = require_userid(request)
+    if body.userid and body.userid != userid:
+        raise HTTPException(status_code=403, detail="userid does not match the signed-in user")
+    if not body.items:
+        raise HTTPException(status_code=400, detail="請至少選擇一筆要儲存的分析。")
+    if len(body.items) > MAX_BATCH_FILES:
+        raise HTTPException(status_code=400, detail=f"一次最多儲存 {MAX_BATCH_FILES} 筆分析。")
+    for item in body.items:
+        if not (item.image or "").strip():
+            raise HTTPException(status_code=400, detail="每筆分析都需要影像網址。")
+
+    docs = [
+        analysis_document(
+            userid=userid,
+            number=item.number,
+            description=item.description,
+            image_url=item.image.strip(),
+            overlay=item.overlay,
+            inner_mask=item.inner_mask,
+            outer_mask=item.outer_mask,
+            outer_fat=item.outer_fat,
+            inner_fat=item.inner_fat,
+            length=item.length,
+            width=item.width,
+        )
+        for item in body.items
+    ]
+    db = get_db()
+    result = await db.analyses.insert_many(docs)
+    created = [
+        serialize_analysis({**doc, "_id": oid})
+        for doc, oid in zip(docs, result.inserted_ids, strict=True)
+    ]
+    return {"message": f"已儲存 {len(created)} 筆分析", "items": created}
 
 
 @app.get("/personal")

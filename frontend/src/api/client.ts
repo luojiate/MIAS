@@ -1,6 +1,6 @@
 ﻿import axios, { isAxiosError } from 'axios'
 import { getBackendUrl } from '@/lib/utils'
-import type { Analysis, UploadResult, User } from '@/types'
+import type { Analysis, BatchUploadResponse, CreateBatchItem, UploadResult, User } from '@/types'
 
 export const api = axios.create({
   baseURL: getBackendUrl(),
@@ -77,6 +77,21 @@ export async function uploadImageRequest(file: File): Promise<UploadResult> {
   return { ...data, image }
 }
 
+export async function uploadImagesRequest(files: File[]): Promise<BatchUploadResponse> {
+  if (!files.length) {
+    throw new Error('請至少選擇一張影像。')
+  }
+  const form = new FormData()
+  for (const file of files) {
+    form.append('images', file, file.name)
+  }
+  const { data } = await api.post('/upload-images', form, { timeout: 0 })
+  if (!data || !Array.isArray(data.results)) {
+    throw new Error('批次分析回應格式不正確。')
+  }
+  return data as BatchUploadResponse
+}
+
 export async function createAnalysisRequest(payload: {
   number: string
   description: string
@@ -84,6 +99,13 @@ export async function createAnalysisRequest(payload: {
   image?: string
 }): Promise<void> {
   await api.post('/create', payload)
+}
+
+export async function createBatchRequest(payload: {
+  userid: string
+  items: CreateBatchItem[]
+}): Promise<void> {
+  await api.post('/create-batch', payload)
 }
 
 export async function listPersonalAnalyses(): Promise<Analysis[]> {

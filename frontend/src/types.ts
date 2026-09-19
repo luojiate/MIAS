@@ -31,3 +31,32 @@ export type UploadResult = {
   width?: number
   url?: string
 }
+
+export type BatchQueueStatus = 'pending' | 'running' | 'success' | 'failed'
+
+export type BatchAnalysisItem = UploadResult & {
+  index: number
+  filename: string
+  success: boolean
+  error?: string | null
+}
+
+export type BatchUploadResponse = {
+  message: string
+  results: BatchAnalysisItem[]
+  succeeded: number
+  failed: number
+}
+
+export type CreateBatchItem = {
+  number: string
+  description: string
+  image: string
+  overlay?: string | null
+  inner_mask?: string | null
+  outer_mask?: string | null
+  outer_fat?: number
+  inner_fat?: number
+  length?: number
+  width?: number
+}

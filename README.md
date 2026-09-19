@@ -86,8 +86,10 @@ CORS 允許 `http://localhost:5173` 與 `http://localhost:3000`（含 credential
 
 ```bash
 cd backend
-uv run python -m unittest tests.test_preprocess -v
+uv run python -m unittest tests.test_preprocess tests.test_batch_upload tests.test_deploy_files -v
 ```
+
+`tests.test_batch_upload` 需要 `httpx`（FastAPI TestClient）。若尚未安裝：`uv run --with httpx python -m unittest tests.test_batch_upload -v`。
 
 ## 3. Frontend（fnm + pnpm）
 
@@ -107,7 +109,7 @@ pnpm run build
 pnpm run preview
 ```
 
-新增分析頁可切換「原圖 / 預測面積」；個人頁可回看疊圖與量測。
+新增分析頁可一次選擇多張影像（最多 8 張、每張 10 MB），佇列顯示等待中／分析中／完成／失敗；個人頁可回看疊圖與量測。
 
 ## API（cookie session）
 
@@ -117,9 +119,13 @@ pnpm run preview
 | POST | `/logout` | no | 清除 session cookie |
 | POST | `/register` | no | `{ name, email, password }`；email 重複 → 400 |
 | POST | `/upload-image` | yes | multipart `image` → 量測 + 疊圖 URL（`overlay` 等） |
-| POST | `/create` | yes | 儲存分析（含影像／疊圖資訊） |
+| POST | `/upload-images` | yes | multipart `images`（最多 8 張）→ `{ results, succeeded, failed }`；伺服器依序推論 |
+| POST | `/create` | yes | 儲存單筆分析（含影像／疊圖資訊） |
+| POST | `/create-batch` | yes | `{ items: [...] }` 一次寫入多筆個人紀錄 |
 | GET | `/personal` | yes | 目前使用者的分析列表 |
 | DELETE | `/delete/{id}` | yes | 僅擁有者可刪 |
+
+批次上限與錯誤訊息為繁體中文（空清單、超過 8 張、空檔、非 JPG/PNG/GIF、超過 10 MB）。
 
 401 時前端導向 `/login`。
 
