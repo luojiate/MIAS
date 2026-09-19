@@ -13,14 +13,38 @@ from bson.errors import InvalidId
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pydantic import BaseModel, EmailStr, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from analyzer import analyze_image
 
 load_dotenv()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _split_origins(value: str) -> list[str]:
+    return [origin.strip() for origin in value.split(",") if origin.strip()]
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
 
 BACKEND_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", BACKEND_DIR / "uploads"))
@@ -29,7 +53,9 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017")
 MONGO_DB = os.getenv("MONGO_DB", "mias")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "mias-dev-session-secret-change-me")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8000").rstrip("/")
+PUBLIC_URL = (
+    os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "http://localhost:8000"
+).rstrip("/")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -39,9 +65,21 @@ ALLOWED_ORIGINS = [
     "http://localhost:43173",
     "http://127.0.0.1:43173",
 ]
-extra_origins = os.getenv("CORS_ORIGINS", "")
-if extra_origins.strip():
-    ALLOWED_ORIGINS.extend(origin.strip() for origin in extra_origins.split(",") if origin.strip())
+EXTRA_ORIGINS = _split_origins(os.getenv("CORS_ORIGINS", ""))
+if PUBLIC_URL.startswith("http"):
+    ALLOWED_ORIGINS.append(PUBLIC_URL)
+ALLOWED_ORIGINS = _dedupe([*ALLOWED_ORIGINS, *EXTRA_ORIGINS])
+
+# Same-origin (FastAPI serves the SPA) → Lax. Cross-site Vercel → Render needs None+Secure.
+CROSS_SITE = bool(EXTRA_ORIGINS)
+IS_HTTPS = PUBLIC_URL.startswith("https://") or _env_bool("RENDER", False)
+SESSION_SAMESITE = os.getenv("SESSION_SAMESITE", "none" if CROSS_SITE else "lax").lower()
+if SESSION_SAMESITE not in {"lax", "strict", "none"}:
+    SESSION_SAMESITE = "lax"
+SESSION_HTTPS_ONLY = _env_bool(
+    "SESSION_HTTPS_ONLY",
+    default=(SESSION_SAMESITE == "none") or IS_HTTPS,
+)
 
 ALLOWED_IMAGE_TYPES = {
     "image/jpeg": ".jpg",
@@ -58,12 +96,45 @@ def get_db() -> AsyncIOMotorDatabase:
     return mongo_client[MONGO_DB]
 
 
+def _resolve_spa_dir() -> Path | None:
+    env = os.getenv("SPA_DIR", "").strip()
+    candidates: list[Path] = []
+    if env:
+        candidates.append(Path(env))
+    candidates.extend(
+        [
+            BACKEND_DIR / "frontend" / "dist",
+            BACKEND_DIR.parent / "frontend" / "dist",
+        ]
+    )
+    for path in candidates:
+        if (path / "index.html").is_file():
+            return path.resolve()
+    return None
+
+
+SPA_DIR = _resolve_spa_dir()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global mongo_client
-    mongo_client = AsyncIOMotorClient(MONGO_URI)
+    mongo_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=20000)
     db = mongo_client[MONGO_DB]
     await db.users.create_index("email", unique=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        from vision.infer import ensure_sessions
+
+        ensure_sessions()
+        print("[mias] ONNX sessions ready", flush=True)
+    except Exception as exc:
+        print(f"[mias] ONNX warmup skipped: {exc!r}", flush=True)
+    print(
+        f"[mias] spa={SPA_DIR} same_site={SESSION_SAMESITE} "
+        f"https_only={SESSION_HTTPS_ONLY} cors={ALLOWED_ORIGINS}",
+        flush=True,
+    )
     yield
     mongo_client.close()
     mongo_client = None
@@ -73,8 +144,8 @@ app = FastAPI(title="Medimage Analysis System", lifespan=lifespan)
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
-    same_site="lax",
-    https_only=False,
+    same_site=SESSION_SAMESITE,
+    https_only=SESSION_HTTPS_ONLY,
     max_age=60 * 60 * 24 * 14,
 )
 app.add_middleware(
@@ -129,6 +200,32 @@ def require_userid(request: Request) -> str:
     if not userid:
         raise HTTPException(status_code=401, detail="Authentication required")
     return str(userid)
+
+
+def public_base_url(request: Request) -> str:
+    """Absolute origin for stored upload URLs (PUBLIC_URL, Render URL, or request host)."""
+    configured = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if configured:
+        base = configured.rstrip("/")
+        if "localhost" not in base and "127.0.0.1" not in base:
+            return base
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if host:
+        return f"{proto}://{host}".rstrip("/")
+    return PUBLIC_URL
+
+
+def _wants_html(request: Request) -> bool:
+    dest = request.headers.get("sec-fetch-dest", "").lower()
+    if dest == "document":
+        return True
+    return "text/html" in request.headers.get("accept", "").lower()
+
+
+def spa_index() -> FileResponse:
+    assert SPA_DIR is not None
+    return FileResponse(SPA_DIR / "index.html")
 
 
 def serialize_analysis(doc: dict[str, Any]) -> dict[str, Any]:
@@ -208,13 +305,14 @@ async def upload_image(request: Request, image: UploadFile = File(...)):
     dest.write_bytes(payload)
 
     metrics = analyze_image(str(dest), out_dir=str(UPLOAD_DIR))
-    image_url = f"{PUBLIC_URL}/uploads/{filename}"
+    origin = public_base_url(request)
+    image_url = f"{origin}/uploads/{filename}"
     overlay_name = metrics.get("overlay_file")
-    overlay_url = f"{PUBLIC_URL}/uploads/{overlay_name}" if overlay_name else None
+    overlay_url = f"{origin}/uploads/{overlay_name}" if overlay_name else None
     inner_mask_name = metrics.get("inner_mask_file")
     outer_mask_name = metrics.get("outer_mask_file")
-    inner_mask_url = f"{PUBLIC_URL}/uploads/{inner_mask_name}" if inner_mask_name else None
-    outer_mask_url = f"{PUBLIC_URL}/uploads/{outer_mask_name}" if outer_mask_name else None
+    inner_mask_url = f"{origin}/uploads/{inner_mask_name}" if inner_mask_name else None
+    outer_mask_url = f"{origin}/uploads/{outer_mask_name}" if outer_mask_name else None
     request.session["userid"] = userid
     request.session["uploaded_image"] = image_url
     request.session["overlay_image"] = overlay_url
@@ -268,6 +366,9 @@ async def create_analysis(request: Request, body: CreateBody):
 
 @app.get("/personal")
 async def personal(request: Request):
+    # Browser refresh of the SPA route must not hit the JSON API (same path).
+    if SPA_DIR is not None and _wants_html(request):
+        return spa_index()
     userid = require_userid(request)
     db = get_db()
     cursor = db.analyses.find({"userid": userid}).sort("_id", -1)
@@ -297,4 +398,16 @@ async def delete_analysis(request: Request, analysis_id: str):
     return {"message": "Analysis deleted"}
 
 
+class SpaStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response("index.html", scope)
+            raise
+
+
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+if SPA_DIR is not None:
+    app.mount("/", SpaStaticFiles(directory=str(SPA_DIR), html=True), name="spa")

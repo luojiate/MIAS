@@ -1,0 +1,31 @@
+# MIAS Blueprint: one Docker web service (FastAPI + built SPA).
+# Database is MongoDB Atlas (set MONGO_URI in the Render Dashboard).
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: mias
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      # Atlas connection string. Dashboard only — do not commit secrets.
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: mias
+      - key: SESSION_SECRET
+        generateValue: true
+      # Set to https://<service>.onrender.com after the first deploy (or rely on RENDER_EXTERNAL_URL).
+      - key: PUBLIC_URL
+        sync: false
+      # Optional extra browser origins (e.g. https://xxx.vercel.app). Leave unset for same-origin SPA.
+      - key: CORS_ORIGINS
+        sync: false
+      - key: MIAS_ORT_PROVIDERS
+        value: CPUExecutionProvider
+      # Same-origin default. For a split Vercel frontend, set none and SESSION_HTTPS_ONLY=true.
+      - key: SESSION_SAMESITE
+        value: lax
