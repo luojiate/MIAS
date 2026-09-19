@@ -19,6 +19,8 @@ dependencies = [
   "itsdangerous>=2.2.0",
   "numpy",
   "onnxruntime-gpu",
+  # Production Docker (Render/Linux, no GPU) installs CPU `onnxruntime` instead.
+  # See root Dockerfile: sed onnxruntime-gpu → onnxruntime. Local uv stays GPU.
   # torch / torchvision intentionally omitted: runtime inference is ONNX Runtime
   # (vision/infer.py imports onnxruntime). Re-add under [project.optional-dependencies]
   # train = ["torch", "torchvision"] if training scripts need them.
