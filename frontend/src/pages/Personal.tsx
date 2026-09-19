@@ -129,19 +129,19 @@ export function PersonalPage() {
                 )}
                 <dl className="grid grid-cols-2 gap-2 text-xs text-zinc-300">
                   <div>
-                    <dt className="text-zinc-500">Outer fat %</dt>
+                    <dt className="text-zinc-500">外層脂肪 (cm²)</dt>
                     <dd>{metric(item.outer_fat)}</dd>
                   </div>
                   <div>
-                    <dt className="text-zinc-500">Inner fat %</dt>
+                    <dt className="text-zinc-500">內層脂肪 (cm²)</dt>
                     <dd>{metric(item.inner_fat)}</dd>
                   </div>
                   <div>
-                    <dt className="text-zinc-500">Length</dt>
+                    <dt className="text-zinc-500">長度 (cm)</dt>
                     <dd>{metric(item.length)}</dd>
                   </div>
                   <div>
-                    <dt className="text-zinc-500">Width</dt>
+                    <dt className="text-zinc-500">寬度 (cm)</dt>
                     <dd>{metric(item.width)}</dd>
                   </div>
                 </dl>

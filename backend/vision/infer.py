@@ -1,6 +1,7 @@
 ﻿"""MIAS fat segmentation inference via ONNX Runtime (+ overlay export)."""
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -9,6 +10,20 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
+
+from vision.preprocess import (
+    CT_SIZE,
+    Crop_and_CLAHE,
+    Max_Area,
+    Read_file,
+    Remove_small_components,
+    Ruler_calcu,
+    Scan_row_col,
+    ct_to_nchw,
+    mask_to_ct_size,
+)
+
+logger = logging.getLogger(__name__)
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_MODELS = BACKEND_DIR / "models"
@@ -49,44 +64,58 @@ def ensure_sessions() -> None:
     _providers = _inner_sess.get_providers()
 
 
-def _preprocess(path: Path) -> tuple[np.ndarray, Image.Image]:
-    img = Image.open(path).convert("L")
-    arr = np.array(img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
-    tensor = arr[None, None, ...]
-    return tensor, img
+def _preprocess(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    image = Read_file(path)
+    ru, ct = Crop_and_CLAHE(image)
+    tensor = ct_to_nchw(ct, IMG_SIZE)
+    if tensor.shape != (1, 1, IMG_SIZE, IMG_SIZE):
+        raise RuntimeError(f"ONNX input must be (1, 1, {IMG_SIZE}, {IMG_SIZE}), got {tensor.shape}")
+    return tensor, ru, ct
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
 
 
-def _predict_mask(sess: ort.InferenceSession, tensor: np.ndarray) -> np.ndarray:
+def _predict_prob(sess: ort.InferenceSession, tensor: np.ndarray) -> np.ndarray:
     input_name = sess.get_inputs()[0].name
     logits = sess.run(None, {input_name: tensor})[0]
-    prob = _sigmoid(logits[0, 0])
-    return (prob >= THRESH).astype(np.uint8)
+    return _sigmoid(logits[0, 0])
 
 
-def _bbox_metrics(mask: np.ndarray, orig_wh: tuple[int, int]) -> tuple[float, float]:
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0:
-        return 0.0, 0.0
-    w256 = float(xs.max() - xs.min() + 1)
-    h256 = float(ys.max() - ys.min() + 1)
-    ow, oh = orig_wh
-    length = round(h256 * (oh / float(IMG_SIZE)) / 10.0, 2)
-    width = round(w256 * (ow / float(IMG_SIZE)) / 10.0, 2)
-    return length, width
+def _ruler_metrics(
+    outer: np.ndarray,
+    inner: np.ndarray,
+    ru: np.ndarray,
+) -> tuple[float, float, float, float]:
+    """Return outerFat, innerFat, length, width. Ruler success → cm² / cm; else 0."""
+    scale = Ruler_calcu(ru)
+    if not isinstance(scale, tuple):
+        logger.warning(
+            "Ruler_calcu failed (no bright tick rows); returning 0.0 cm/cm². "
+            "Overlay and masks are still produced on the CLAHE CT crop."
+        )
+        return 0.0, 0.0, 0.0, 0.0
+    cm_per_p, area_per_p = scale
+    outer_fat = round(float(np.sum(outer != 0) * area_per_p), 2)
+    inner_fat = round(float(np.sum(inner != 0) * area_per_p), 2)
+    length_px, width_px = Scan_row_col(outer)
+    length = round(length_px * cm_per_p, 2)
+    width = round(width_px * cm_per_p, 2)
+    return outer_fat, inner_fat, length, width
 
 
-def _colorize_overlay(gray: Image.Image, inner: np.ndarray, outer: np.ndarray) -> Image.Image:
-    """Resize masks to original size and blend: outer=amber, inner=cyan."""
-    base = gray.convert("RGBA")
-    ow, oh = base.size
-    inner_img = Image.fromarray((inner * 255).astype(np.uint8)).resize((ow, oh), Image.NEAREST)
-    outer_img = Image.fromarray((outer * 255).astype(np.uint8)).resize((ow, oh), Image.NEAREST)
-    inner_m = np.array(inner_img) > 127
-    outer_m = np.array(outer_img) > 127
+def _colorize_overlay(ct: np.ndarray, inner: np.ndarray, outer: np.ndarray) -> Image.Image:
+    """Blend 560×560 masks onto the CLAHE CT crop: outer=amber, inner=cyan."""
+    if ct.ndim != 2:
+        raise ValueError("CLAHE CT crop must be grayscale")
+    if inner.shape != ct.shape:
+        inner = mask_to_ct_size(inner.astype(np.float32), 0.5)
+    if outer.shape != ct.shape:
+        outer = mask_to_ct_size(outer.astype(np.float32), 0.5)
+    base = Image.fromarray(ct, mode="L").convert("RGBA")
+    inner_m = inner > 0
+    outer_m = outer > 0
 
     overlay = np.array(base, dtype=np.float32)
     # outer amber
@@ -108,17 +137,16 @@ def analyze(path: str | Path, out_dir: str | Path | None = None) -> dict[str, An
     ensure_sessions()
     assert _inner_sess is not None and _outer_sess is not None
     path = Path(path)
-    tensor, gray = _preprocess(path)
-    inner = _predict_mask(_inner_sess, tensor)
-    outer = _predict_mask(_outer_sess, tensor)
-    inner_pct = round(float(inner.mean() * 100.0), 2)
-    outer_pct = round(float(outer.mean() * 100.0), 2)
-    union = np.clip(inner.astype(np.int16) + outer.astype(np.int16), 0, 1).astype(np.uint8)
-    length, width = _bbox_metrics(union, gray.size)
+    tensor, ru, ct = _preprocess(path)
+    inner_prob = _predict_prob(_inner_sess, tensor)
+    outer_prob = _predict_prob(_outer_sess, tensor)
+    inner = Remove_small_components(mask_to_ct_size(inner_prob, THRESH), min_area=60)
+    outer = Max_Area(mask_to_ct_size(outer_prob, THRESH))
+    outer_fat, inner_fat, length, width = _ruler_metrics(outer, inner, ru)
 
     result: dict[str, Any] = {
-        "outerFat": outer_pct,
-        "innerFat": inner_pct,
+        "outerFat": outer_fat,
+        "innerFat": inner_fat,
         "length": length,
         "width": width,
         "providers": _providers,
@@ -130,15 +158,15 @@ def analyze(path: str | Path, out_dir: str | Path | None = None) -> dict[str, An
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         stem = uuid.uuid4().hex
-        overlay = _colorize_overlay(gray, inner, outer)
+        overlay = _colorize_overlay(ct, inner, outer)
         overlay_path = out / f"{stem}_overlay.jpg"
         overlay.save(overlay_path, quality=92)
-        # also save binary masks at original resolution for optional download
-        ow, oh = gray.size
-        Image.fromarray((np.array(Image.fromarray((inner * 255).astype(np.uint8)).resize((ow, oh), Image.NEAREST)))).save(out / f"{stem}_inner_mask.png")
-        Image.fromarray((np.array(Image.fromarray((outer * 255).astype(np.uint8)).resize((ow, oh), Image.NEAREST)))).save(out / f"{stem}_outer_mask.png")
+        Image.fromarray((inner * 255).astype(np.uint8)).save(out / f"{stem}_inner_mask.png")
+        Image.fromarray((outer * 255).astype(np.uint8)).save(out / f"{stem}_outer_mask.png")
         result["overlay_file"] = overlay_path.name
         result["inner_mask_file"] = f"{stem}_inner_mask.png"
         result["outer_mask_file"] = f"{stem}_outer_mask.png"
+        if overlay.size != (CT_SIZE, CT_SIZE):
+            logger.warning("Overlay size %s != expected %s×%s CLAHE crop", overlay.size, CT_SIZE, CT_SIZE)
 
     return result

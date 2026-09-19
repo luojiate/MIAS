@@ -206,10 +206,10 @@ export function CreatePage() {
 
             <div className="mb-5 grid grid-cols-2 gap-3">
               {[
-                { label: 'Outer fat %', value: result?.outerFat },
-                { label: 'Inner fat %', value: result?.innerFat },
-                { label: 'Length', value: result?.length },
-                { label: 'Width', value: result?.width },
+                { label: '外層脂肪 (cm²)', value: result?.outerFat },
+                { label: '內層脂肪 (cm²)', value: result?.innerFat },
+                { label: '長度 (cm)', value: result?.length },
+                { label: '寬度 (cm)', value: result?.width },
               ].map((m) => (
                 <div key={m.label} className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-3">
                   <p className="text-xs text-zinc-500">{m.label}</p>
