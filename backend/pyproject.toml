@@ -1,0 +1,41 @@
+[project]
+name = "mias-backend"
+version = "1.0.0"
+description = "MIAS FastAPI backend (ONNX Runtime inference)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "motor>=3.6.0",
+  "pymongo>=4.10.0",
+  "python-multipart>=0.0.12",
+  "passlib[bcrypt]>=1.7.4",
+  "bcrypt>=4.0.0,<5",
+  "pillow>=11.0.0",
+  "opencv-python-headless>=4.8.0",
+  "python-dotenv>=1.0.1",
+  "email-validator>=2.2.0",
+  "itsdangerous>=2.2.0",
+  "numpy",
+  "onnxruntime-gpu",
+  # torch / torchvision intentionally omitted: runtime inference is ONNX Runtime
+  # (vision/infer.py imports onnxruntime). Re-add under [project.optional-dependencies]
+  # train = ["torch", "torchvision"] if training scripts need them.
+]
+
+[project.optional-dependencies]
+train = [
+  "torch",
+  "torchvision",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.uv]
+package = false

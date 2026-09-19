@@ -30,3 +30,6 @@ backend/uploads/*
 !.vscode/extensions.json
 .idea
 .DS_Store
+.venv/
+node_modules/
+.pnpm-store/
