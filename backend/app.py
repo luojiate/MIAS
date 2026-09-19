@@ -135,6 +135,9 @@ def serialize_analysis(doc: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(doc["_id"]),
         "image": doc.get("image", ""),
+        "overlay": doc.get("overlay", ""),
+        "inner_mask": doc.get("inner_mask", ""),
+        "outer_mask": doc.get("outer_mask", ""),
         "number": doc.get("number", ""),
         "description": doc.get("description", ""),
         "userid": doc.get("userid", ""),
@@ -204,10 +207,19 @@ async def upload_image(request: Request, image: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
     dest.write_bytes(payload)
 
-    metrics = analyze_image(str(dest))
+    metrics = analyze_image(str(dest), out_dir=str(UPLOAD_DIR))
     image_url = f"{PUBLIC_URL}/uploads/{filename}"
+    overlay_name = metrics.get("overlay_file")
+    overlay_url = f"{PUBLIC_URL}/uploads/{overlay_name}" if overlay_name else None
+    inner_mask_name = metrics.get("inner_mask_file")
+    outer_mask_name = metrics.get("outer_mask_file")
+    inner_mask_url = f"{PUBLIC_URL}/uploads/{inner_mask_name}" if inner_mask_name else None
+    outer_mask_url = f"{PUBLIC_URL}/uploads/{outer_mask_name}" if outer_mask_name else None
     request.session["userid"] = userid
     request.session["uploaded_image"] = image_url
+    request.session["overlay_image"] = overlay_url
+    request.session["inner_mask"] = inner_mask_url
+    request.session["outer_mask"] = outer_mask_url
     request.session["outerFat"] = metrics["outerFat"]
     request.session["innerFat"] = metrics["innerFat"]
     request.session["length"] = metrics["length"]
@@ -216,6 +228,9 @@ async def upload_image(request: Request, image: UploadFile = File(...)):
         "message": "Image uploaded",
         "image": image_url,
         "url": image_url,
+        "overlay": overlay_url,
+        "innerMask": inner_mask_url,
+        "outerMask": outer_mask_url,
         "outerFat": metrics["outerFat"],
         "innerFat": metrics["innerFat"],
         "length": metrics["length"],
@@ -234,6 +249,9 @@ async def create_analysis(request: Request, body: CreateBody):
 
     doc = {
         "image": image_url,
+        "overlay": request.session.get("overlay_image", ""),
+        "inner_mask": request.session.get("inner_mask", ""),
+        "outer_mask": request.session.get("outer_mask", ""),
         "number": body.number,
         "description": body.description,
         "userid": userid,

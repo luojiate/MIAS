@@ -1,4 +1,4 @@
-import axios, { isAxiosError } from 'axios'
+﻿import axios, { isAxiosError } from 'axios'
 import { getBackendUrl } from '@/lib/utils'
 import type { Analysis, UploadResult, User } from '@/types'
 
@@ -92,6 +92,9 @@ export async function listPersonalAnalyses(): Promise<Analysis[]> {
   return data.map((item: Record<string, unknown>) => ({
     id: String(item.id ?? item._id ?? ''),
     image: String(item.image ?? ''),
+    overlay: String(item.overlay ?? ''),
+    inner_mask: String(item.inner_mask ?? ''),
+    outer_mask: String(item.outer_mask ?? ''),
     number: (item.number as string | number) ?? '',
     description: String(item.description ?? ''),
     userid: String(item.userid ?? ''),

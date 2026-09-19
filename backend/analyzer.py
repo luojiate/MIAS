@@ -1,17 +1,7 @@
-"""Optional vision hook used by POST /upload-image.
-
-The FastAPI app looks for a script (default: vision/main.py) and runs:
-
-    python <script> <image-path>
-
-The script should print a JSON object with outerFat, innerFat, length, and width.
-If the script is missing or fails, the API still accepts the upload with zeros.
-"""
-
+﻿"""Vision hook for POST /upload-image — ONNX EfficientTransUNet + overlay."""
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -27,26 +17,14 @@ PLACEHOLDERS = {
 BACKEND_DIR = Path(__file__).resolve().parent
 
 
-def _candidate_scripts() -> list[Path]:
-    env_path = os.getenv("MIAS_ANALYZER_SCRIPT")
-    names = [
-        BACKEND_DIR / "vision" / "main.py",
-        BACKEND_DIR / "vision_main.py",
-        BACKEND_DIR / "analyze.py",
-    ]
-    if env_path:
-        names.insert(0, Path(env_path))
-    return names
-
-
-def _normalize(data: dict[str, Any]) -> dict[str, float]:
+def _normalize(data: dict[str, Any]) -> dict[str, Any]:
     mapping = {
         "outerFat": ("outerFat", "outer_fat"),
         "innerFat": ("innerFat", "inner_fat"),
         "length": ("length",),
         "width": ("width",),
     }
-    result = dict(PLACEHOLDERS)
+    result: dict[str, Any] = dict(PLACEHOLDERS)
     for dest, keys in mapping.items():
         for key in keys:
             if key in data and data[key] is not None:
@@ -55,23 +33,34 @@ def _normalize(data: dict[str, Any]) -> dict[str, float]:
                     break
                 except (TypeError, ValueError):
                     continue
+    for key in ("overlay_file", "inner_mask_file", "outer_mask_file"):
+        if key in data and data[key]:
+            result[key] = str(data[key])
     return result
 
 
-def analyze_image(image_path: str) -> dict[str, float]:
-    script = next((path for path in _candidate_scripts() if path.is_file()), None)
-    if script is None:
+def analyze_image(image_path: str, out_dir: str | None = None) -> dict[str, Any]:
+    try:
+        from vision.infer import analyze
+
+        return _normalize(analyze(image_path, out_dir=out_dir))
+    except Exception as exc:
+        print(f"[analyzer] in-process failed: {exc!r}", file=sys.stderr)
+
+    script = BACKEND_DIR / "vision" / "main.py"
+    if not script.is_file():
         return dict(PLACEHOLDERS)
     try:
         completed = subprocess.run(
             [sys.executable, str(script), image_path],
             capture_output=True,
             text=True,
-            timeout=60,
-            cwd=str(script.parent),
+            timeout=180,
+            cwd=str(BACKEND_DIR),
             check=False,
         )
         if completed.returncode != 0:
+            print(completed.stderr, file=sys.stderr)
             return dict(PLACEHOLDERS)
         stdout = completed.stdout.strip()
         if not stdout:
@@ -80,5 +69,6 @@ def analyze_image(image_path: str) -> dict[str, float]:
         if not isinstance(payload, dict):
             return dict(PLACEHOLDERS)
         return _normalize(payload)
-    except Exception:
+    except Exception as exc:
+        print(f"[analyzer] CLI failed: {exc!r}", file=sys.stderr)
         return dict(PLACEHOLDERS)

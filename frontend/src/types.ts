@@ -1,4 +1,4 @@
-export type User = {
+﻿export type User = {
   ID: string
   name: string
   email: string
@@ -8,6 +8,9 @@ export type User = {
 export type Analysis = {
   id: string
   image: string
+  overlay?: string
+  inner_mask?: string
+  outer_mask?: string
   number: string | number
   description: string
   userid: string
@@ -19,6 +22,9 @@ export type Analysis = {
 
 export type UploadResult = {
   image: string
+  overlay?: string | null
+  innerMask?: string | null
+  outerMask?: string | null
   outerFat?: number
   innerFat?: number
   length?: number
