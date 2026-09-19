@@ -70,6 +70,7 @@ export function CreatePage() {
   const { user } = useAuth()
   const navigate = useNavigate()
   const itemsRef = useRef<QueueItem[]>([])
+  const inputRef = useRef<HTMLInputElement | null>(null)
   const [items, setItems] = useState<QueueItem[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [view, setView] = useState<'original' | 'overlay'>('overlay')
@@ -104,22 +105,24 @@ export function CreatePage() {
     setView('overlay')
 
     const incoming = Array.from(nextFiles)
+    if (!incoming.length) return
     setItems((current) => {
       const base = replace ? [] : current
       if (replace) revokePreviews(current)
-      const room = MAX_BATCH_FILES - base.length
-      if (incoming.length === 0) {
-        setFileError(null)
-        if (replace) setSelectedId(null)
+      const existingKeys = new Set(base.map((item) => `${item.filename}:${item.file.size}`))
+      const uniqueIncoming = incoming.filter((file) => !existingKeys.has(`${file.name}:${file.size}`))
+      if (!uniqueIncoming.length) {
+        setFileError('這些檔案已在佇列中。')
         return base
       }
+      const room = MAX_BATCH_FILES - base.length
       if (room <= 0) {
         setFileError(`一次最多上傳 ${MAX_BATCH_FILES} 張影像。`)
         return base
       }
-      const accepted = incoming.slice(0, room)
+      const accepted = uniqueIncoming.slice(0, room)
       setFileError(
-        incoming.length > room ? `一次最多上傳 ${MAX_BATCH_FILES} 張影像，已略過多餘檔案。` : null,
+        uniqueIncoming.length > room ? `一次最多上傳 ${MAX_BATCH_FILES} 張影像，已略過多餘檔案。` : null,
       )
       const created: QueueItem[] = accepted.map((file) => {
         const error = validateFile(file)
@@ -144,8 +147,20 @@ export function CreatePage() {
 
   function onFileChange(event: ChangeEvent<HTMLInputElement>) {
     const list = event.target.files ? Array.from(event.target.files) : []
-    addFiles(list, true)
+    addFiles(list, false)
     event.target.value = ''
+  }
+
+  function clearQueue() {
+    if (busy) return
+    setItems((current) => {
+      revokePreviews(current)
+      return []
+    })
+    setSelectedId(null)
+    setFileError(null)
+    setServerError(null)
+    setView('overlay')
   }
 
   function onDrop(event: DragEvent<HTMLDivElement>) {
@@ -291,9 +306,16 @@ export function CreatePage() {
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="image" className="text-zinc-200">
-                選擇影像（可多選）
-              </Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="image" className="text-zinc-200">
+                  選擇影像（可多選）
+                </Label>
+                {items.length > 0 && (
+                  <Button type="button" size="sm" variant="ghost" onClick={clearQueue} disabled={busy}>
+                    清除佇列
+                  </Button>
+                )}
+              </div>
               <div
                 onDragEnter={(event) => {
                   event.preventDefault()
@@ -313,15 +335,25 @@ export function CreatePage() {
                   dragging ? 'border-indigo-400 bg-indigo-500/10' : 'border-zinc-600 bg-zinc-950',
                 )}
               >
-                <Input
+                <input
+                  ref={inputRef}
                   id="image"
                   type="file"
                   multiple
                   accept="image/jpeg,image/png,image/gif,.jpg,.jpeg,.png,.gif"
                   onChange={onFileChange}
                   disabled={busy}
-                  className="border-zinc-600 bg-zinc-950 text-zinc-100 file:text-zinc-200"
+                  className="sr-only"
                 />
+                <Button
+                  type="button"
+                  variant="secondary"
+                  className="w-full"
+                  disabled={busy}
+                  onClick={() => inputRef.current?.click()}
+                >
+                  {items.length ? `再加入檔案（已選 ${items.length} 張）` : '選擇檔案'}
+                </Button>
                 <p className="mt-2 text-xs text-zinc-500">
                   可拖放或一次選擇最多 {MAX_BATCH_FILES} 張 JPG、PNG 或 GIF（每張上限 10 MB）。伺服器會依序分析以免記憶體不足。
                 </p>
